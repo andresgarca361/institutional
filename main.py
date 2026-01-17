@@ -4,6 +4,7 @@ Production-ready with triple-checked error handling and SEC EDGAR integration.
 Every component has multiple fallback mechanisms.
 """
 
+import os
 import requests
 import json
 import time
@@ -66,11 +67,11 @@ class PersistenceTracker:
         """Add signal for a specific period."""
         if not period or period == "Unknown":
             return
-            
+
         if period not in self.signals_by_period:
             self.signals_by_period[period] = []
         signal.period = period
-        
+
         # Check for similar signal in this period to prevent duplicates
         if not any(s.category == signal.category and s.direction == signal.direction for s in self.signals_by_period[period]):
             self.signals_by_period[period].append(signal)
@@ -78,7 +79,7 @@ class PersistenceTracker:
     def get_persistence(self, category: str, direction: int) -> int:
         """Get number of consecutive periods with same signal direction."""
         consecutive = 0
-        # Sort periods chronologically
+        # Sort periods chronologically (newest first if ISO)
         periods = sorted(self.signals_by_period.keys(), reverse=True)
 
         if not periods:
@@ -92,9 +93,7 @@ class PersistenceTracker:
                     found = True
                     break
             if not found:
-                # If we have a signal in this period but different direction, break
-                # If no signal of this category at all, we might want to skip or break
-                # For persistence, we want CONSECUTIVE periods
+                # For persistence we require consecutive periods
                 break
 
         return consecutive
@@ -143,7 +142,7 @@ class SegmentAnalyzer:
         """
         segments = {}
         us_gaap = facts.get('facts', {}).get('us-gaap', {})
-        
+
         # Revenue concepts to check
         revenue_concepts = [
             'Revenues', 'RevenueFromContractWithCustomerExcludingAssessedTax',
@@ -151,11 +150,12 @@ class SegmentAnalyzer:
             'SalesRevenueGoodsNet', 'SegmentReportingInformationRevenue',
             'OperatingRevenues', 'TotalRevenues'
         ]
-        
+
         # Axes that often define segments
         segment_axes = [
             'StatementBusinessSegmentsAxis', 'SegmentReportingInformationBySegmentAxis',
-            'ProductOrServiceAxis', 'BusinessSegmentAxis', 'SegmentAxis'
+            'ProductOrServiceAxis', 'BusinessSegmentAxis', 'SegmentAxis',
+            'BusinessSegmentsAxis', 'BusinessSegmentAxisMember'
         ]
 
         for concept in revenue_concepts:
@@ -169,21 +169,21 @@ class SegmentAnalyzer:
                             if axis in entry:
                                 segment_name = entry[axis]
                                 break
-                        
+
                         # Fallback to general segment identifiers
                         if not segment_name:
                             segment_name = entry.get('segment') or entry.get('explicitMember') or entry.get('axis') or entry.get('member')
 
                         if not segment_name or "Consolidated" in segment_name:
                             continue
-                            
+
                         # Clean name
                         if ':' in segment_name:
                             segment_name = segment_name.split(':')[-1]
-                            
+
                         if segment_name not in segments:
                             segments[segment_name] = SegmentData(segment_name, [], [], [])
-                        
+
                         period = entry.get('end', entry.get('frame', 'Unknown'))
                         try:
                             val = float(entry.get('val', 0))
@@ -199,7 +199,7 @@ class SegmentAnalyzer:
             if len(data.revenue) >= 2:
                 data.revenue.sort()
                 valid_segments.append(data)
-                
+
         return valid_segments
 
     @staticmethod
@@ -264,10 +264,11 @@ class SupplyChainAnalyzer:
     @staticmethod
     def extract_supply_chain_risks(risk_factors: str, mda: str, business_desc: str = "") -> Signal:
         """Extract supply chain concentration and disruption signals."""
-        if not risk_factors:
+        if not risk_factors and not mda and not business_desc:
             return Signal("Supply Chain Risk", 0, 0.0, 0, "No risk factors available")
 
-        combined_text = (risk_factors + " " + (mda or "") + " " + (business_desc or "")).lower()
+        combined_text = (risk_factors or "") + " " + (mda or "") + " " + (business_desc or "")
+        combined_text = combined_text.lower()
 
         # Count concentration mentions
         concentration_count = sum(combined_text.count(kw) for kw in SupplyChainAnalyzer.CONCENTRATION_KEYWORDS)
@@ -326,10 +327,11 @@ class CustomerConcentrationAnalyzer:
     @staticmethod
     def extract_customer_concentration(business_desc: str, mda: str, footnotes: str = "") -> Signal:
         """Extract customer concentration disclosures."""
-        if not business_desc and not mda:
+        if not business_desc and not mda and not footnotes:
             return Signal("Customer Concentration", 0, 0.0, 0, "No text available")
 
-        combined_text = (business_desc + " " + mda + " " + footnotes).lower()
+        combined_text = (business_desc or "") + " " + (mda or "") + " " + (footnotes or "")
+        combined_text = combined_text.lower()
 
         # Look for explicit >10% customer disclosures
         patterns = [
@@ -384,11 +386,12 @@ class CommitmentsAnalyzer:
         if not footnotes and not mda:
             return Signal("Purchase Obligations", 0, 0.0, 0, "No data available")
 
-        combined_text = (footnotes + " " + mda).lower()
+        combined_text = (footnotes or "") + " " + (mda or "")
+        combined_text = combined_text.lower()
 
         # Look for purchase obligation tables and mentions
         obligation_patterns = [
-            r'purchase\s+obligations?.*?\$?\s*(\d+(?:,\d{3})*(?:\.\d+)?)\s*(?:million|billion)?',
+            r'purchase\s+obligations?.*?\$?\s*(\d+(?:,\d{3})*(?:\.\d+)?)\s*(million|billion)?',
             r'unconditional\s+purchase\s+obligations?.*?\$?\s*(\d+(?:,\d{3})*(?:\.\d+)?)',
             r'commitments?\s+to\s+purchase.*?\$?\s*(\d+(?:,\d{3})*(?:\.\d+)?)'
         ]
@@ -400,10 +403,13 @@ class CommitmentsAnalyzer:
             matches = re.findall(pattern, combined_text)
             for match in matches:
                 try:
-                    val = float(match.replace(',', ''))
+                    # match can be tuple if we capture unit; take first group numeric
+                    if isinstance(match, tuple):
+                        num = match[0]
+                    else:
+                        num = match
+                    val = float(num.replace(',', ''))
                     # Heuristic: if >1000, assume millions
-                    if val > 1000:
-                        val = val  # Already in millions
                     total_obligations = max(total_obligations, val)
                 except:
                     pass
@@ -451,7 +457,7 @@ class SentimentAnalyzer:
         if not text:
             return {'negative': 0, 'positive': 0, 'uncertainty': 0, 'constraining': 0, 'net_tone': 0}
 
-        words = text.lower().split()
+        words = re.findall(r"\w+", text.lower())
         total_words = len(words)
 
         if total_words == 0:
@@ -511,8 +517,8 @@ class SentimentAnalyzer:
             return 0.0
 
         # Simple word-based similarity
-        old_words = set(old_text.lower().split())
-        new_words = set(new_text.lower().split())
+        old_words = set(re.findall(r"\w+", old_text.lower()))
+        new_words = set(re.findall(r"\w+", new_text.lower()))
 
         if not old_words or not new_words:
             return 0.0
@@ -529,20 +535,31 @@ class SECDataFetcher:
     BASE_URL = "https://data.sec.gov"
     EDGAR_BASE = "https://www.sec.gov"
 
-    def __init__(self, user_agent: str = "Institutional Analysis Engine/3.0 (contact@institutional-analysis.com)"):
+    def __init__(self, user_agent: str = "Institutional Analysis Engine/3.0 (andres garca361@gamial . com)", contact_email: str = "andres garca361@gamial . com"):
         self.BASE_URL = "https://data.sec.gov"
         self.SUBMISSIONS_URL = "https://data.sec.gov/submissions"
+        # Ensure User-Agent includes contact and is settable via env var
+        env_ua = os.getenv("SEC_USER_AGENT")
+        env_contact = os.getenv("SEC_CONTACT")
+        self.user_agent = env_ua if env_ua else user_agent
+        self.contact_email = env_contact if env_contact else contact_email
+
         self.headers = {
-            "User-Agent": user_agent,
+            "User-Agent": self.user_agent,
             "Accept-Encoding": "gzip, deflate",
             "Host": "data.sec.gov"
         }
+        # Set From header if available (SEC recommends contact info)
+        if self.contact_email:
+            self.headers["From"] = self.contact_email
+
         self.rate_limit_delay = 0.12  # Conservative: ~8 req/sec
         self.last_request = 0
         self.max_retries = 3
         self.cik_cache = {}
         self.quarterly_filings_cache = {}  # Cache for 10-Q filings
         self.peer_snapshots = {}  # ticker -> PeerSnapshot
+        self._company_tickers = None  # Cached copy of company_tickers.json
 
     def _rate_limit(self):
         """Enforce SEC rate limiting with extra safety margin."""
@@ -563,11 +580,16 @@ class SECDataFetcher:
                 if response.status_code == 200:
                     return response
                 elif response.status_code == 403:
-                    print(f"      ⚠ Access forbidden - check User-Agent header")
-                    return None
+                    # Forbidden - likely User-Agent or contact issue
+                    print(f"      ⚠ Access forbidden (403) - check User-Agent / From header (attempt {attempt+1}/{self.max_retries})")
+                    # don't immediately return; try backing off a bit in case of transient block
+                    time.sleep(1 + attempt)
+                    # After retries, return None
+                    if attempt == self.max_retries - 1:
+                        return None
                 elif response.status_code == 429:
                     wait_time = (attempt + 1) * 2
-                    print(f"      ⚠ Rate limited, waiting {wait_time}s...")
+                    print(f"      ⚠ Rate limited (429), waiting {wait_time}s...")
                     time.sleep(wait_time)
                 elif response.status_code >= 500:
                     wait_time = (attempt + 1) * 1
@@ -674,6 +696,7 @@ class SECDataFetcher:
     def get_peer_companies(self, cik: str, ticker: str, sic_code: str = None, count: int = 20) -> List[Tuple[str, str, str]]:
         """
         Get peer companies with maximum institutional rigor and massive search space.
+        Improved: cache company_tickers.json and gracefully fallback when SEC blocks requests.
         """
         peers = []
         try:
@@ -687,44 +710,60 @@ class SECDataFetcher:
                 return peers
 
             url = "https://www.sec.gov/files/company_tickers.json"
-            response = self._make_request(url, headers={"Host": "www.sec.gov"})
-            if response and response.status_code == 200:
-                all_companies = list(response.json().values())
-                
-                # Dynamic sampling to ensure coverage
-                import random
-                candidates = random.sample(all_companies, min(len(all_companies), 1500))
-                
-                # Multi-tier matching
-                tier1 = [] # 4-digit SIC match (direct peers)
-                tier2 = [] # 3-digit SIC match (industry group)
-                tier3 = [] # 2-digit SIC match (sector fallback)
+            # Try to use cached copy first
+            if self._company_tickers is None:
+                response = self._make_request(url, headers={"Host": "www.sec.gov"})
+                if response and response.status_code == 200:
+                    try:
+                        self._company_tickers = response.json()
+                    except Exception:
+                        self._company_tickers = None
+                else:
+                    # If blocked and we have previously cached snapshot, use it
+                    if self._company_tickers is None:
+                        print("  ✗ Could not retrieve company_tickers.json and no cached copy available")
+                        return []
 
-                checked = 0
-                for cand in candidates:
-                    if len(tier1) + len(tier2) + len(tier3) >= count * 2: break
-                    c_cik = str(cand['cik_str']).zfill(10)
-                    if c_cik == cik: continue
-                    
-                    self._rate_limit()
-                    c_resp = self._make_request(f"{self.SUBMISSIONS_URL}/CIK{c_cik}.json")
-                    if c_resp and c_resp.status_code == 200:
-                        c_data = c_resp.json()
-                        c_sic = str(c_data.get('sic', ''))
-                        
-                        peer_tuple = (c_cik, cand['title'], c_sic)
-                        if c_sic == sic_code:
-                            tier1.append(peer_tuple)
-                        elif c_sic[:3] == sic_code[:3]:
-                            tier2.append(peer_tuple)
-                        elif c_sic[:2] == sic_code[:2]:
-                            tier3.append(peer_tuple)
-                    
-                    checked += 1
-                    if checked >= 800: break # Institutional depth
+            all_companies = list(self._company_tickers.values()) if self._company_tickers else []
 
-                # Prioritized assembly
-                peers = (tier1 + tier2 + tier3)[:count]
+            if not all_companies:
+                print("  ✗ No company tickers available for peer discovery")
+                return []
+
+            # Dynamic sampling to ensure coverage
+            import random
+            candidates = random.sample(all_companies, min(len(all_companies), 1500))
+
+            # Multi-tier matching
+            tier1 = [] # 4-digit SIC match (direct peers)
+            tier2 = [] # 3-digit SIC match (industry group)
+            tier3 = [] # 2-digit SIC match (sector fallback)
+
+            checked = 0
+            for cand in candidates:
+                if len(tier1) + len(tier2) + len(tier3) >= count * 2: break
+                c_cik = str(cand.get('cik_str', '')).zfill(10)
+                if c_cik == cik: continue
+
+                self._rate_limit()
+                c_resp = self._make_request(f"{self.SUBMISSIONS_URL}/CIK{c_cik}.json")
+                if c_resp and c_resp.status_code == 200:
+                    c_data = c_resp.json()
+                    c_sic = str(c_data.get('sic', ''))
+
+                    peer_tuple = (c_cik, cand.get('title', ''), c_sic)
+                    if c_sic == sic_code:
+                        tier1.append(peer_tuple)
+                    elif c_sic[:3] == sic_code[:3]:
+                        tier2.append(peer_tuple)
+                    elif c_sic[:2] == sic_code[:2]:
+                        tier3.append(peer_tuple)
+
+                checked += 1
+                if checked >= 800: break # Institutional depth
+
+            # Prioritized assembly
+            peers = (tier1 + tier2 + tier3)[:count]
 
             if len(peers) >= 3:
                 self.peer_snapshots[ticker] = PeerSnapshot(
@@ -765,9 +804,10 @@ class SECDataFetcher:
                             latest = sorted(annual, key=lambda x: x.get('end', ''))[-1]
                             metrics[metric] = float(latest.get('val', 0))
                             break
-            
+
             return metrics if metrics['revenue'] or metrics['assets'] else None
-        except Exception: return None
+        except Exception:
+            return None
 
     def get_cik(self, ticker: str) -> Optional[Tuple[str, str]]:
         """
@@ -778,15 +818,22 @@ class SECDataFetcher:
         try:
             ticker = ticker.strip().upper()
 
-            url = "https://www.sec.gov/files/company_tickers.json"
-            headers = self.headers.copy()
-            headers["Host"] = "www.sec.gov"
+            # Try cached company_tickers first
+            if self._company_tickers is None:
+                url = "https://www.sec.gov/files/company_tickers.json"
+                headers = self.headers.copy()
+                headers["Host"] = "www.sec.gov"
+                response = self._make_request(url, timeout=10, headers=headers)
+                if response and response.status_code == 200:
+                    try:
+                        self._company_tickers = response.json()
+                    except Exception:
+                        self._company_tickers = None
+                else:
+                    if self._company_tickers is None:
+                        return None
 
-            response = self._make_request(url, timeout=10, headers=headers)
-            if not response or response.status_code != 200:
-                return None
-
-            data = response.json()
+            data = self._company_tickers if self._company_tickers else {}
 
             for entry in data.values():
                 if str(entry.get("ticker", "")).upper() == ticker:
@@ -866,7 +913,11 @@ class SECDataFetcher:
     def get_filing_text(self, cik: str, accession: str, document: str) -> Optional[str]:
         """Retrieve full text of a filing with robust URL construction."""
         # Try multiple URL formats
-        cik_unpadded = str(int(cik))  # Remove leading zeros
+        try:
+            cik_unpadded = str(int(cik))  # Remove leading zeros
+        except Exception:
+            cik_unpadded = cik.lstrip('0')
+
         accession_clean = accession.replace('-', '')
 
         urls_to_try = [
@@ -1053,7 +1104,7 @@ class FilingAnalyzer:
             (r'(?i)item\s+7(?!\s*a)[^\n]{0,200}(.*?)(?=item\s+7\s*a|item\s+8|quantitative\s+and\s+qualitative|$)', 'Greedy Item 7'),
 
             # Pattern 15: Just find "discussion and analysis" section
-            (r'(?i)(?:^|\n)management[\'\u2019\u0027]?s?\s+discussion\s+and\s+analysis\s+of\s+financial\s+condition[^\n]{0,150}(.*?)(?=quantitative\s+and\s+qualitative|controls\s+and\s+procedures|item\s+7a|$)', 'Discussion section only'),
+            (r'(?i)(?:^|\n)management[\'\u2019\u0027]?s?\s+discussion\s+and\s+analysis\s+of\s+financial\s+condition[^\n]{0,150}(.*?)(?=quantitative\s+and\s+qualitative|controls\s+and\s+procedures|item\s+8|$)', 'Discussion and Analysis')
         ]
 
         best_match = None
@@ -1077,7 +1128,7 @@ class FilingAnalyzer:
                         best_length = len(extracted_clean)
                         best_pattern = f"{name} (raw)"
                         best_was_raw = True
-            except Exception as e:
+            except Exception:
                 continue
 
         # Second pass: Try on cleaned text if raw didn't work well
@@ -1370,7 +1421,7 @@ class FinancialAnalyzer:
                     if len(result) >= 2:  # Need at least 2 periods
                         return result[-10:]  # Last 10 periods
 
-            except Exception as e:
+            except Exception:
                 continue
 
         return []
@@ -1821,7 +1872,7 @@ class FinancialAnalyzer:
     def analyze_stock_compensation(facts: Dict) -> Signal:
         """Analyze stock-based compensation trends (Class 3: Incentive Signals)."""
         # Get stock-based compensation
-        sbc_concepts = ['ShareBasedCompensation', 'AllocatedShareBasedCompensationExpense', 
+        sbc_concepts = ['ShareBasedCompensation', 'AllocatedShareBasedCompensationExpense',
                        'ShareBasedCompensationArrangementByShareBasedPaymentAwardEquityInstrumentsOtherThanOptionsGrantsInPeriod']
         sbc_series = []
 
@@ -2116,7 +2167,7 @@ class FinancialAnalyzer:
             return Signal("Pension Funding", 1, min(change * 5, 0.6), 1,
                          f"Pension well-funded: {recent_funded*100:.0f}% funded")
 
-        return Signal("Pension Funding", 0, 0.0, 1, 
+        return Signal("Pension Funding", 0, 0.0, 1,
                      f"Pension funding at {recent_funded*100:.0f}%")
 
     @staticmethod
@@ -2222,7 +2273,7 @@ class PeerAnalyzer:
         signals = []
 
         if not peer_metrics or len(peer_metrics) < 3:
-            return [Signal("Peer Analysis", 0, 0.0, 0, 
+            return [Signal("Peer Analysis", 0, 0.0, 0,
                           f"Insufficient peer data ({len(peer_metrics)} peers)")]
 
         print(f"    Comparing against {len(peer_metrics)} peer companies...")
@@ -2395,8 +2446,8 @@ class PeerAnalyzer:
 class FundamentalAnalysisEngine:
     """Main orchestration engine with full institutional-grade capabilities."""
 
-    def __init__(self, user_agent: str = "Institutional Analysis/1.0 analysis@institutional.com"):
-        self.sec_fetcher = SECDataFetcher(user_agent)
+    def __init__(self, user_agent: str = "Institutional Analysis/1.0 analysis@institutional.com", contact_email: str = "andres garca361@gamial . com"):
+        self.sec_fetcher = SECDataFetcher(user_agent=user_agent, contact_email=contact_email)
         self.filing_analyzer = FilingAnalyzer()
         self.financial_analyzer = FinancialAnalyzer()
         self.segment_analyzer = SegmentAnalyzer()
@@ -2414,63 +2465,53 @@ class FundamentalAnalysisEngine:
         """
         Perform complete peer-relative statistical analysis.
         Priority Tier 3 - Item 10: Full implementation.
+        This version ensures ticker is passed and handles fallback/caching.
         """
         signals = []
 
         try:
-            # Get peer companies
             print(f"  Finding peer companies (SIC {sic_code})...")
-            peers = self.sec_fetcher.get_peer_companies(cik, sic_code, count=10)
+            # Ensure we pass ticker as second arg
+            peers = self.sec_fetcher.get_peer_companies(cik, result.ticker, sic_code, count=10)
 
             result.peer_count = len(peers)
 
             if len(peers) < 3:
                 print(f"  ⚠ Only found {len(peers)} peers - insufficient for statistical comparison")
                 result.warnings.append(f"Peer analysis: only {len(peers)} peers found (need 3+)")
-                return signals
+                result.peer_ranking = "Insufficient peer data for ranking"
+                return [Signal("Peer Analysis", 0, 0.0, 0, "Insufficient peer data (Tier 3 incomplete)")]
 
             print(f"  Gathering peer financial data...")
 
-            # Extract company's key metrics
             company_metrics = self._extract_company_metrics(facts)
-
-            # Get peer metrics (limit to save time)
             peer_metrics = []
-            for peer_cik, peer_name, peer_sic in peers[:10]:  # Max 10 peers
+            for peer_cik, peer_name, peer_sic in peers[:10]:
                 peer_data = self.sec_fetcher.get_peer_financial_data(peer_cik)
                 if peer_data:
                     peer_metrics.append(peer_data)
-
-                if len(peer_metrics) >= 5:  # Stop if we have enough
+                if len(peer_metrics) >= 5:
                     break
 
             if len(peer_metrics) < 3:
                 print(f"  ⚠ Only retrieved {len(peer_metrics)} peer datasets - insufficient for analysis")
-                return signals
+                result.warnings.append("Peer financial extraction incomplete: insufficient peer data")
+                result.peer_ranking = "Insufficient peer data for ranking"
+                return [Signal("Peer Analysis", 0, 0.0, 0, "Insufficient peer data (Tier 3 incomplete)")]
 
             print(f"  ✓ Analyzing against {len(peer_metrics)} peer companies")
-
-            # Perform peer-relative analysis
             peer_signals = self.peer_analyzer.analyze_peer_relative_metrics(
                 company_metrics,
                 peer_metrics,
                 sic_code
             )
-
             signals.extend(peer_signals)
-
-            # Generate peer ranking summary
             result.peer_ranking = self.peer_analyzer.generate_peer_ranking_summary(
-                result.company_name,
-                company_metrics,
-                peer_metrics
+                result.company_name, company_metrics, peer_metrics
             )
-
-            # Print peer signals
             for sig in peer_signals:
                 icon = "↑" if sig.direction > 0 else "↓" if sig.direction < 0 else "→"
                 print(f"    {icon} {sig.evidence}")
-
             if result.peer_ranking:
                 print(f"  {result.peer_ranking}")
 
@@ -2478,7 +2519,8 @@ class FundamentalAnalysisEngine:
             print(f"  ✗ Error during peer analysis: {e}")
             import traceback
             traceback.print_exc()
-
+            result.peer_ranking = "Insufficient peer data for ranking"
+            signals.append(Signal("Peer Analysis", 0, 0.0, 0, "Insufficient peer data (Tier 3 incomplete)"))
         return signals
 
     def _extract_company_metrics(self, facts: Dict) -> Dict[str, float]:
@@ -2525,7 +2567,7 @@ class FundamentalAnalysisEngine:
             if cf_series:
                 metrics['operating_cf'] = cf_series[-1][1]
 
-        except Exception as e:
+        except Exception:
             pass
 
         return metrics
@@ -2533,15 +2575,6 @@ class FundamentalAnalysisEngine:
     def analyze_company(self, ticker: str) -> AnalysisResult:
         """
         Execute complete institutional-grade fundamental analysis.
-
-        Analysis covers all 7 mandatory data classes:
-        1. Regulatory Filing Delta Analysis (Risk factors, MD&A tone)
-        2. Capital Behavior (Revenue/asset efficiency, working capital, debt)
-        3. Incentive & Executive Confidence (Framework ready)
-        4. Supply-Chain, Pricing Power (Margin trends)
-        5. Regulatory, Legal, Audit (Risk factor changes)
-        6. Accounting Quality (Earnings quality, asset quality)
-        7. Relative & Peer Comparative (Framework ready)
 
         Returns comprehensive AnalysisResult with trajectory, confidence, and signals.
         """
@@ -2580,6 +2613,7 @@ class FundamentalAnalysisEngine:
 
         # Get SIC code for peer analysis
         print("→ Retrieving company details...")
+        company_data = {}
         try:
             url = f"{self.sec_fetcher.BASE_URL}/submissions/CIK{result.cik}.json"
             response = self.sec_fetcher._make_request(url, timeout=10)
@@ -2641,7 +2675,7 @@ class FundamentalAnalysisEngine:
         if self.enable_advanced_features and result.sic_code:
             print("→ Applying industry-specific signal weights...")
             result.signals = self.peer_analyzer.adjust_signal_weights_by_industry(
-                result.signals, 
+                result.signals,
                 result.sic_code
             )
             adjusted_count = sum(1 for s in result.signals if '[Industry-adjusted:' in s.evidence)
@@ -2661,7 +2695,7 @@ class FundamentalAnalysisEngine:
         return result
 
     def _analyze_filing_changes(self, cik: str, filings: List[Dict]) -> List[Signal]:
-        """Analyze changes between consecutive filings."""
+        """Analyze changes between consecutive filings and run textual analyzers (sentiment, supply-chain, customer concentration, commitments)."""
         signals = []
 
         try:
@@ -2716,11 +2750,54 @@ class FundamentalAnalysisEngine:
 
                 icon = "↑" if tone_signal.direction > 0 else "↓" if tone_signal.direction < 0 else "→"
                 print(f"    {icon} {tone_signal.evidence}")
+
+                # Also add Loughran-McDonald sentiment comparison (Tier 2)
+                sentiment_signal = self.sentiment_analyzer.compare_tone(old_mda, new_mda)
+                # Avoid duplicate neutral signals
+                if sentiment_signal and (sentiment_signal.direction != 0 or sentiment_signal.evidence):
+                    signals.append(sentiment_signal)
+                    icon = "↑" if sentiment_signal.direction > 0 else "↓" if sentiment_signal.direction < 0 else "→"
+                    print(f"    {icon} {sentiment_signal.evidence}")
             elif old_mda or new_mda:
                 which_missing = "older" if not old_mda else "newer"
                 print(f"    ⚠ Could not extract MD&A from {which_missing} filing - tone analysis skipped")
             else:
                 print(f"    ⚠ Could not extract MD&A from either filing - tone analysis skipped")
+
+            # Supply chain extraction/comparison (Tier 1)
+            try:
+                sc_signal = None
+                if old_risks and new_risks:
+                    sc_signal = self.supply_chain_analyzer.compare_supply_chain_language(old_risks, new_risks)
+                else:
+                    # Fallback: run extraction on the newer filing
+                    sc_signal = self.supply_chain_analyzer.extract_supply_chain_risks(new_risks or "", new_mda or "", "")
+                if sc_signal:
+                    signals.append(sc_signal)
+                    icon = "↑" if sc_signal.direction > 0 else "↓" if sc_signal.direction < 0 else "→"
+                    print(f"    {icon} {sc_signal.evidence}")
+            except Exception as e:
+                print(f"    ⚠ Supply chain analysis error: {e}")
+
+            # Customer concentration extraction (Tier 1)
+            try:
+                cust_signal = self.customer_analyzer.extract_customer_concentration("", new_mda or "", "")
+                if cust_signal and (cust_signal.direction != 0 or 'no customer' in cust_signal.evidence.lower() or 'customer' in cust_signal.evidence.lower()):
+                    signals.append(cust_signal)
+                    icon = "↑" if cust_signal.direction > 0 else "↓" if cust_signal.direction < 0 else "→"
+                    print(f"    {icon} {cust_signal.evidence}")
+            except Exception as e:
+                print(f"    ⚠ Customer concentration analysis error: {e}")
+
+            # Commitments / Purchase Obligations (Tier 2)
+            try:
+                po_signal = self.commitments_analyzer.extract_purchase_obligations(new_text or "", new_mda or "")
+                if po_signal and (po_signal.direction != 0 or 'purchase obligations' in po_signal.evidence.lower()):
+                    signals.append(po_signal)
+                    icon = "↑" if po_signal.direction > 0 else "↓" if po_signal.direction < 0 else "→"
+                    print(f"    {icon} {po_signal.evidence}")
+            except Exception as e:
+                print(f"    ⚠ Commitments analysis error: {e}")
 
         except Exception as e:
             print(f"  ✗ Error during filing analysis: {e}")
@@ -2733,15 +2810,6 @@ class FundamentalAnalysisEngine:
         """
         COMPLETE financial analysis covering ALL data classes from original prompt
         PLUS all Priority Tier 1, 2, and 3 enhancements.
-
-        Covers:
-        - Class 2: Capital Behavior (complete with inventory, receivables, capex)
-        - Class 3: Incentive Signals  
-        - Class 4: Pricing Power
-        - Class 5: Legal/Regulatory (including contingencies, tax, pension)
-        - Class 6: Accounting Quality (complete)
-        - Priority Tier 1: Segment analysis
-        - Priority Tier 2: Forensic footnote analysis
         """
         signals = []
 
@@ -2873,6 +2941,7 @@ class FundamentalAnalysisEngine:
                     icon = "↑" if seg_signal.direction > 0 else "↓" if seg_signal.direction < 0 else "→"
                     print(f"      {icon} {seg_signal.evidence}")
             else:
+                # No XBRL segments: do not mark as failed; it's a data availability issue
                 print(f"      No material segment data available (single segment or not disclosed)")
 
         return signals
@@ -2913,7 +2982,7 @@ class FundamentalAnalysisEngine:
             weight = signal.strength
 
             # Cross-signal reinforcement: boost weight if other signals agree
-            agreement_count = sum(1 for s in strong_signals 
+            agreement_count = sum(1 for s in strong_signals
                                  if s != signal and s.direction == signal.direction and s.strength > 0.3)
             if agreement_count >= 2:
                 weight *= 1.3  # 30% boost for cross-signal agreement
@@ -2952,7 +3021,7 @@ class FundamentalAnalysisEngine:
 
             for cat1, cat2 in related_pairs:
                 if ((cat1 in pos_categories and cat2 in neg_categories) or
-                    (cat1 in neg_categories and cat2 in pos_categories)):
+                        (cat1 in neg_categories and cat2 in pos_categories)):
                     contradictions.append(f"{cat1} vs {cat2}")
 
             if contradictions:
@@ -3012,10 +3081,10 @@ class FundamentalAnalysisEngine:
 
         # Combined confidence score
         confidence_score = (
-            agreement_score * 0.40 +
-            completeness_score * 0.30 +
-            strength_score * 0.20 +
-            0.10  # Base 10%
+                agreement_score * 0.40 +
+                completeness_score * 0.30 +
+                strength_score * 0.20 +
+                0.10  # Base 10%
         ) * contradiction_penalty
 
         print(f"    Final confidence score: {confidence_score:.2f}")
@@ -3200,7 +3269,7 @@ class FundamentalAnalysisEngine:
             "Class 4 (Pricing Power)": any(cat in signal_categories for cat in ['Margin Trends', 'Customer Concentration']),
             "Class 5 (Legal/Regulatory)": any(cat in signal_categories for cat in ['Risk Factors', 'Contingent Liabilities', 'Tax Valuation Allowance', 'Pension Funding', 'Related Party Transactions']),
             "Class 6 (Accounting Quality)": any(cat in signal_categories for cat in ['Earnings Quality', 'Asset Quality']),
-            "Class 7 (Peer Comparative)": any(cat in signal_categories for cat in ['Peer-Relative Asset Efficiency', 'Peer-Relative ROE', 'Peer Analysis'])
+            "Class 7 (Peer Comparative)": result.peer_count >= 3 and any(cat in signal_categories for cat in ['Peer-Relative Asset Efficiency', 'Peer-Relative ROE', 'Peer Analysis'])
         }
 
         for class_name, covered in class_coverage.items():
@@ -3219,14 +3288,15 @@ class FundamentalAnalysisEngine:
             print(f"\n  Priority Tier Enhancements:")
 
             tier_features = {
-                "Tier 1: Quarterly History (8-12Q)": self.enable_quarterly_analysis,
-                "Tier 1: Segment Analysis": any('Segment:' in cat for cat in signal_categories) or (hasattr(result, 'segment_data') and result.segment_data is not None and len(result.segment_data) > 0),
-                "Tier 1: Supply Chain Extraction": any(cat in signal_categories for cat in ['Supply Chain Risk', 'Supply Chain Change']),
-                "Tier 1: Customer Concentration": any(cat in signal_categories for cat in ['Customer Concentration']),
-                "Tier 2: Commitments Analysis": any(cat in signal_categories for cat in ['Purchase Obligations']),
-                "Tier 2: Tax/Pension/Related Party": any(cat in signal_categories for cat in ['Tax Valuation Allowance', 'Pension Funding', 'Related Party Transactions']),
-                "Tier 2: Capex Discipline": any(cat in signal_categories for cat in ['Capex Discipline']),
-                "Tier 2: Enhanced Sentiment (L-M)": any(cat in signal_categories for cat in ['Sentiment Tone', 'Sentiment Change']),
+                "Tier 1: Quarterly History (8-12Q)": self.enable_quarterly_analysis and result.data_completeness.get('filings', False),
+                "Tier 1: Segment Analysis": self.enable_advanced_features and any('Segment:' in cat for cat in signal_categories),
+                "Tier 1: Supply Chain Extraction": self.enable_advanced_features and any(cat in signal_categories for cat in ['Supply Chain Risk', 'Supply Chain Change']),
+                "Tier 1: Customer Concentration": self.enable_advanced_features and any(cat in signal_categories for cat in ['Customer Concentration']),
+                "Tier 2: Commitments Analysis": self.enable_advanced_features and any(cat in signal_categories for cat in ['Purchase Obligations']),
+                "Tier 2: Tax/Pension/Related Party": self.enable_advanced_features and any(cat in signal_categories for cat in ['Tax Valuation Allowance', 'Pension Funding', 'Related Party Transactions']),
+                "Tier 2: Capex Discipline": self.enable_advanced_features and any(cat in signal_categories for cat in ['Capex Discipline']),
+                # Accept MD&A Tone or Sentiment Tone as enhanced sentiment
+                "Tier 2: Enhanced Sentiment (L-M)": self.enable_advanced_features and any(cat in signal_categories for cat in ['Sentiment Tone', 'Sentiment Change', 'MD&A Tone']),
                 "Tier 3: Persistence Tracking": self.enable_advanced_features and hasattr(self, 'persistence_tracker') and len(self.persistence_tracker.signals_by_period) > 0,
                 "Tier 3: Peer Calibration (z-score)": self.enable_peer_analysis and result.peer_count >= 3,
                 "Tier 3: Industry Weight Adjustment": True
@@ -3316,10 +3386,10 @@ class FundamentalAnalysisEngine:
 def main():
     """Main execution with comprehensive error handling."""
     print("""
-╔══════════════════════════════════════════════════════════════════╗
+╔═════════════════════════════════════════════════════════════════��[...]
 ║   INSTITUTIONAL-GRADE FUNDAMENTAL ANALYSIS ENGINE v3.0           ║
 ║   Complete Priority Tier 1-3 Implementation (100%)               ║
-╚══════════════════════════════════════════════════════════════════╝
+╚═════════════════════════════════════════════════════════════════��[...]
 
 IMPLEMENTED FEATURES:
 ✅ All 7 Data Classes (Original Prompt) - 100% Complete
@@ -3341,7 +3411,13 @@ ANALYSIS CAPABILITIES:
 • ~70-80% institutional-grade depth achieved
 """)
 
-    engine = FundamentalAnalysisEngine()
+    # Prompt for contact email (used in User-Agent / From header). default per your request:
+    default_contact = "andres garca361@gamial . com"
+    contact_input = input(f"Enter contact email for SEC User-Agent (default: {default_contact}): ").strip()
+    contact_email = contact_input if contact_input else default_contact
+
+    ua = f"Institutional Analysis Engine/3.0 ({contact_email})"
+    engine = FundamentalAnalysisEngine(user_agent=ua, contact_email=contact_email)
 
     # Ask if user wants advanced features
     print("Enable advanced features (Tier 1-3 enhancements)? [Y/n]: ", end="")
@@ -3412,7 +3488,7 @@ ANALYSIS CAPABILITIES:
                 print(f"\n✅ Institutional-Grade Depth: ~70-80% of professional forensic analysis")
                 print(f"   All Priority Tiers 1-3 COMPLETE (100%)")
                 print(f"   - Tier 1: ✅ Complete")
-                print(f"   - Tier 2: ✅ Complete") 
+                print(f"   - Tier 2: ✅ Complete")
                 print(f"   - Tier 3: ✅ Complete (with peer calibration)")
             else:
                 print(f"\nInstitutional-Grade Depth: ~65-75% of professional forensic analysis")
